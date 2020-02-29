@@ -3,7 +3,7 @@ import json
 import re
 from enum import Enum
 
-from libvmi import AccessContext, TranslateMechanism, Registers, X86Reg, VMIWinVer
+from libvmi import AccessContext, TranslateMechanism, Registers, X86Reg, VMIWinVer, LibvmiError
 
 from vmidbg.vmistruct import VMIStruct
 from vmidbg.abstractdebugcontext import AbstractDebugContext
@@ -43,23 +43,36 @@ class WindowsThread:
 
     def read_registers(self):
         self.log.debug('%s: read registers (state: %s)', self.id, self.State)
-        if self.State == ThreadState.RUNNING:
+        if self.is_running():
             return self.vmi.get_vcpuregs(0)
         else:
             regs = Registers()
-            regs[X86Reg.RAX] = self.kthread.TrapFrame.Eax
-            regs[X86Reg.RBX] = self.kthread.TrapFrame.Ebx
-            regs[X86Reg.RCX] = self.kthread.TrapFrame.Ecx
-            regs[X86Reg.RDX] = self.kthread.TrapFrame.Edx
-            regs[X86Reg.RSI] = self.kthread.TrapFrame.Esi
-            regs[X86Reg.RDI] = self.kthread.TrapFrame.Edi
-            regs[X86Reg.RIP] = self.kthread.TrapFrame.Eip
-            regs[X86Reg.RBP] = self.kthread.TrapFrame.Ebp
+            if self.vmi.get_address_width() == 4:
+                regs[X86Reg.RAX] = self.kthread.TrapFrame.Eax
+                regs[X86Reg.RBX] = self.kthread.TrapFrame.Ebx
+                regs[X86Reg.RCX] = self.kthread.TrapFrame.Ecx
+                regs[X86Reg.RDX] = self.kthread.TrapFrame.Edx
+                regs[X86Reg.RSI] = self.kthread.TrapFrame.Esi
+                regs[X86Reg.RDI] = self.kthread.TrapFrame.Edi
+                regs[X86Reg.RIP] = self.kthread.TrapFrame.Eip
+                regs[X86Reg.RBP] = self.kthread.TrapFrame.Ebp
+            else:
+                regs[X86Reg.RAX] = self.kthread.TrapFrame.Rax
+                regs[X86Reg.RBX] = self.kthread.TrapFrame.Rbx
+                regs[X86Reg.RCX] = self.kthread.TrapFrame.Rcx
+                regs[X86Reg.RDX] = self.kthread.TrapFrame.Rdx
+                regs[X86Reg.RSI] = self.kthread.TrapFrame.Rsi
+                regs[X86Reg.RDI] = self.kthread.TrapFrame.Rdi
+                regs[X86Reg.RIP] = self.kthread.TrapFrame.Rip
+                regs[X86Reg.RBP] = self.kthread.TrapFrame.Rbp
             regs[X86Reg.RSP] = self.kthread.KernelStack
             return regs
 
     def is_alive(self):
         return True
+
+    def is_running(self):
+        return self.State == ThreadState.RUNNING
 
     def __str__(self):
         return "[{}] - addr: {}, start_address: {}, state: {}"\
@@ -73,8 +86,9 @@ class WindowsTaskDescriptor:
         self.rekall = rekall
         self.rekall_task = self.rekall['$STRUCTS']['_EPROCESS'][1]
         self.addr = task_addr - self.vmi.get_offset('win_tasks')
-        self.dtb = self.vmi.read_32_va(self.addr + self.vmi.get_offset('win_pdbase'), 0)
-        self.pid = self.vmi.read_32_va(self.addr + self.vmi.get_offset('win_pid'), 0)
+        self.eprocess = VMIStruct(self.vmi, self.rekall['$STRUCTS'], '_EPROCESS', self.addr)
+        self.pid = self.eprocess.UniqueProcessId
+        self.dtb = self.vmi.read_addr_va(self.addr + self.vmi.get_offset('win_pdbase'), 0)
         self.name = self.vmi.read_str_va(self.addr + self.vmi.get_offset('win_pname'), 0)
         self.thread_head = self.addr + self.rekall_task['ThreadListHead'][0]
         self.thread_head_entry = self.vmi.read_addr_va(self.addr + self.rekall_task['ThreadListHead'][0], 0)
@@ -126,26 +140,87 @@ class WindowsDebugContext(AbstractDebugContext):
         # 2 - find our target name in process list
         # process name might include regex chars
         pattern = re.escape(self.target_name)
-        found = [desc for desc in self.list_processes() if re.match(pattern, desc.name)]
+        found = [desc for desc in self.list_processes() if re.match(pattern, desc.name, re.IGNORECASE)]
         if not found:
-            self.log.debug('%s not found in process list:', self.target_name)
-            for desc in self.list_processes():
-                self.log.debug(desc)
-            raise RuntimeError('Could not find process')
-        if len(found) > 1:
-            self.log.warning('Found %s processes matching "%s", picking the first match ([%s])',
-                             len(found), self.target_name, found[0].pid)
-        self.target_desc = found[0]
-        self.log.info('Process: {}'.format(self.target_desc))
-        # 4 - enumerate threads
-        for thread in self.list_threads():
-            self.log.info('Thread: {}'.format(thread))
+            self.log.debug('%s not found in process list', self.target_name)
+            self.attach_new_process()
+        else:
+            if len(found) > 1:
+                self.log.warning('Found %s processes matching "%s", picking the first match ([%s])',
+                                 len(found), self.target_name, found[0].pid)
+            self.target_desc = found[0]
+            self.log.info('Process: {}'.format(self.target_desc))
+            # 4 - enumerate threads
+            for thread in self.list_threads():
+                self.log.info('Thread: {}'.format(thread))
+
+    def attach_new_process(self):
+        self.log.info('Waiting for %s process to start...', self.target_name)
+        if self.vmi.get_winver() == VMIWinVer.OS_WINDOWS_XP:
+            thread_startup_sym = 'KiThreadStartup'
+        else:
+            thread_startup_sym = 'KiStartUserThread'
+        thread_startup_addr = self.vmi.translate_ksym2v(thread_startup_sym)
+        self.log.debug('%s: %s', thread_startup_sym, hex(thread_startup_addr))
+        # continue to thread startup routine
+        self.bpm.continue_until(thread_startup_addr)
+        # set target desc
+        dtb = self.vmi.get_vcpureg(X86Reg.CR3.value, 0)
+        self.target_desc = self.dtb_to_desc(dtb)
+        # get ETHREAD.StartAddress address
+        thread_desc = self.get_current_running_thread()
+        thread_start_addr = thread_desc.start_addr
+        self.log.debug('ETHREAD.StartAddress: %s', hex(thread_start_addr))
+        # TODO: fix pagefault injection
+        # we cannot use inject a pagefault via our mov eax, [eax], for unclear reasons
+        # the kernel will have a BSOD
+        # I tested moving to PspUserThreadStartup to have a lower IRQL (APC_LEVEL)
+        # doesn't work either
+        # so find another process where ETHREAD.StartAddress is mapped
+        # get paddr, and use this to place the breakpoint
+        thread_start_paddr = None
+        for desc in self.list_processes():
+            try:
+                dtb = desc.dtb
+                self.log.info('Checking if addr is mapped in %s space', desc.name)
+                thread_start_paddr = self.vmi.pagetable_lookup(dtb, thread_start_addr)
+            except LibvmiError:
+                self.log.info('Fail')
+            else:
+                self.log.info('Found at frame: %s', hex(thread_start_paddr))
+                break
+
+        self.bpm.continue_until(thread_start_addr, paddr=thread_start_paddr)
+        if self.vmi.get_winver() == VMIWinVer.OS_WINDOWS_XP:
+            # BaseProcessStartThunk
+            if self.vmi.get_address_width() == 4:
+                # 32 bits
+                # read entrypoint address from EAX
+                entrypoint_addr = self.vmi.get_vcpureg(X86Reg.RAX.value, 0)
+            else:
+                # 64 bits
+                raise RuntimeError('Not implemented')
+        else:
+            # RtlUserThreadStart
+            if self.vmi.get_address_width() == 4:
+                # 32 bits
+                raise RuntimeError('Not implemented')
+            else:
+                # 64 bits
+                entrypoint_addr = self.vmi.get_vcpureg(X86Reg.RCX.value, 0)
+                self.log.debug("Entrypoint")
+        self.log.debug('Entrypoint: %s', hex(entrypoint_addr))
+        # continue to entrypoint
+        self.bpm.continue_until(entrypoint_addr)
 
     def detach(self):
         self.vmi.resume_vm()
 
     def get_dtb(self):
-        return self.target_desc.dtb
+        if not self.target_desc:
+            return self.vmi.get_vcpureg(X86Reg.CR3.value, 0)
+        else:
+            return self.target_desc.dtb
 
     def dtb_to_desc(self, dtb):
         found = [desc for desc in self.list_processes() if desc.dtb == dtb]
@@ -157,15 +232,20 @@ class WindowsDebugContext(AbstractDebugContext):
         return desc
 
     def get_access_context(self, address):
-        return AccessContext(TranslateMechanism.PROCESS_PID,
-                             addr=address, pid=self.target_desc.pid)
+        if self.target_desc is None:
+            # PID 0 is kernel
+            return AccessContext(TranslateMechanism.PROCESS_PID,
+                                 addr=address, pid=0)
+        else:
+            return AccessContext(TranslateMechanism.PROCESS_PID,
+                                 addr=address, pid=self.target_desc.pid)
 
     def get_current_running_thread(self):
         # TODO use KPCR
         found = [thread for thread in self.list_threads() if thread.State ==
                  ThreadState.RUNNING]
         if not found:
-            self.log.warning('Cannot find current running thread %s', tid)
+            self.log.warning('Cannot find current running thread')
             return None
         if len(found) > 1:
             self.log.warning('Multiple threads running')

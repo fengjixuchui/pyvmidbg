@@ -1,6 +1,7 @@
 # pyvmidbg
 
 [![Slack](https://maxcdn.icons8.com/Color/PNG/48/Mobile/slack-48.png)](https://vmidbg.slack.com)
+[![Build Status](https://travis-ci.org/Wenzel/pyvmidbg.svg?branch=master)](https://travis-ci.org/Wenzel/pyvmidbg)
 [![Join the chat at https://gitter.im/pyvmidbg/Lobby](https://badges.gitter.im/trailofbits/algo.svg)](https://gitter.im/pyvmidbg/Lobby)
 [![standard-readme compliant](https://img.shields.io/badge/readme%20style-standard-brightgreen.svg?style=flat-square)](https://github.com/RichardLitt/standard-readme)
 
@@ -45,19 +46,48 @@ analyzing malicious code
 Existing solutions like GDB stubs included in `QEMU`, `VMware` or `VirtualBox` can only
 pause the VM and debug the kernel, but lack the guest knowledge to track and follow the rest of the processes.
 
+Project presentation at [Insomni'Hack 2019](https://insomnihack.ch/conference-2019/):
+- [video](https://www.youtube.com/watch?v=-nXY_p8c_bQ&list=PLcAhMYXnWf9t139KR-LhEMQuqmg8lRAgo&index=3)
+- [slides](https://drive.google.com/file/d/1ZMUszfwWDOljdDfPOJgkEfSabNy0UAJR/view)
+
 ### Vision
 
 ![vmidbg](https://user-images.githubusercontent.com/964610/53703373-9fed3580-3e11-11e9-96f8-47b3f38044cf.jpg)
 
+Current support:
+- Stubs:
+    - GDB
+- Hypervisors:
+    - Xen
+    - KVM
+
+### State of hypervisor's VMI support
+
+- [Xen](https://wiki.xenproject.org/wiki/Virtual_Machine_Introspection)
+    * 2011: Xen 4.1: first hypervisor to support VMI upstream
+    * 2015: Xen 4.6: best hypervisor for VMI
+    * libvmi: fully supported
+    * pyvmidbg: supported
+- [KVM](https://github.com/KVM-VMI/kvm-vmi)
+    * 2017: BitDefender published a set VMI patches on the [mailing list](https://www.spinics.net/lists/kvm/msg151508.html)
+    * libvmi: support is ongoing, see `kvm-vmi/libvmi` (branch `kvmi`)
+    * pyvmidbg: supported
+- VirtualBox
+    * unofficial VMI patches thanks to [Winbagility](https://github.com/Winbagility/Winbagility) project
+- VMware/Hyper-V: no sign of interest as of today
+
 ## Features
 
-- intercept process at `CR3` load
-- read/write memory
-- get/set registers
-- continue execution
-- singlestep
+- attach to existing process
+    * Windows: find `EPROCESS` and `ETHREADS` state
+    * Linux: pause at `CR3` load
+- attach new process (entrypoint):
+    * Windows: follow first thread creation and break at entrypoint
+    * Linux: not implemented
+- singlestep/continue: wait for the process to be scheduled
+    * process must have a single thread
 - breakin (`CTRL-C`)
-- insert/remove software breakpoint
+- software breakpoints
 
 ## Requirements
 
@@ -86,6 +116,8 @@ vmidbg <port> <vm> [<process>]
 
 ## Demo
 
+### Debugging `cmd.exe` in Windows XP
+
 [high-quality](https://drive.google.com/open?id=1clumU_P8K-M1mgQ4RaNVSrWg6sxojw8d)
 
 1. starts `cmd.exe` in `Windows XP` nested VM in Xen
@@ -95,6 +127,15 @@ vmidbg <port> <vm> [<process>]
 5. avoid breakpoints from the rest of the system, only hit if `cmd.exe` is executing
 
 ![pyvmidbg](https://github.com/Wenzel/wenzel.github.io/blob/master/public/images/pyvmidbg-demo.gif)
+
+### Debugging `mspaint.exe` in Windows 10
+
+[Debugging `mspaint.exe`](https://drive.google.com/file/d/15VUAXmUJg7pY_EL0rNVxrQdWs5VTdvZI/view?usp=sharing)
+
+## Limitations
+
+- the VM must have 1 VCPU
+- no steath breakpoints implemented yet (`int3` into memory)
 
 ## References
 

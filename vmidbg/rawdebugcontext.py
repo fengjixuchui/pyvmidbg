@@ -20,6 +20,9 @@ class RawThread:
         # always alive, it's a VCPU
         return True
 
+    def is_running(self):
+        return True
+
     def read_registers(self):
         self.log.debug('%s: read registers', self.id)
         return self.vmi.get_vcpuregs(self.vcpu_id)
@@ -49,7 +52,7 @@ class RawDebugContext(AbstractDebugContext):
 
     def get_dtb(self):
         # get current CR3
-        return self.vmi.get_vcpu_reg(X86Reg.CR3.value, 0)
+        return self.vmi.get_vcpureg(X86Reg.CR3.value, 0)
 
     def get_access_context(self, address):
         return AccessContext(TranslateMechanism.PROCESS_DTB,

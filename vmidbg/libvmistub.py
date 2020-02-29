@@ -8,7 +8,6 @@ from binascii import hexlify, unhexlify
 from libvmi import Libvmi, INIT_DOMAINNAME, INIT_EVENTS, VMIOS, LibvmiError, X86Reg
 
 from .gdbstub import GDBStub, GDBPacket, GDBCmd, GDBSignal, PACKET_SIZE
-from .breakpoint import BreakpointManager
 from .rawdebugcontext import RawDebugContext
 from .linuxdebugcontext import LinuxDebugContext
 from .windowsdebugcontext import WindowsDebugContext
@@ -77,7 +76,6 @@ class LibVMIStub(GDBStub):
                     self.ctx = LinuxDebugContext(self.vmi, self.process)
                 else:
                     raise RuntimeError('unhandled ostype: {}'.format(ostype.value))
-            self.bp = BreakpointManager(self.vmi, self.ctx)
             self.ctx.attach()
             self.attached = True
         except:
@@ -88,7 +86,7 @@ class LibVMIStub(GDBStub):
         try:
             self.ctx.detach()
             self.attached = False
-            self.bp.restore_opcodes()
+            self.ctx.bpm.restore_opcodes()
         except:
             logging.exception('Exception while detaching from debug context')
         finally:
@@ -211,21 +209,31 @@ class LibVMIStub(GDBStub):
         cur_thread = self.ctx.get_thread()
         regs = cur_thread.read_registers()
 
-        gen_regs_32 = [
-            X86Reg.RAX, X86Reg.RCX, X86Reg.RDX, X86Reg.RBX,
-            X86Reg.RSP, X86Reg.RBP, X86Reg.RSI, X86Reg.RDI, X86Reg.RIP
-        ]
+        # for some reason,  GDB has a different parsing for gen registers
+        # between 32 and 64 bits
+        if addr_width == 4:
+            gen_regs_x86 = [
+                X86Reg.RAX, X86Reg.RCX, X86Reg.RDX, X86Reg.RBX,
+                X86Reg.RSP, X86Reg.RBP, X86Reg.RSI, X86Reg.RDI
+            ]
+        else:
+            gen_regs_x86 = [
+                X86Reg.RAX, X86Reg.RBX, X86Reg.RCX, X86Reg.RDX,
+                X86Reg.RSI, X86Reg.RDI, X86Reg.RBP, X86Reg.RSP
+            ]
 
-        gen_regs_64 = [
-            X86Reg.R9, X86Reg.R10, X86Reg.R11, X86Reg.R12,
+        gen_regs_x64 = [
+            X86Reg.R8, X86Reg.R9, X86Reg.R10, X86Reg.R11, X86Reg.R12,
             X86Reg.R13, X86Reg.R14, X86Reg.R15
         ]
         # not available through libvmi
         seg_regs = [x+1 for x in range(0, 6)]
         # write general registers
-        msg = b''.join([hexlify(struct.pack(pack_fmt, regs[r])) for r in gen_regs_32])
+        msg = b''.join([hexlify(struct.pack(pack_fmt, regs[r])) for r in gen_regs_x86])
         if addr_width == 8:
-            msg += b''.join([hexlify(struct.pack(pack_fmt, regs[r])) for r in gen_regs_64])
+            msg += b''.join([hexlify(struct.pack(pack_fmt, regs[r])) for r in gen_regs_x64])
+        # write RIP
+        msg += hexlify(struct.pack(pack_fmt, regs[X86Reg.RIP]))
         # write eflags
         msg += hexlify(struct.pack(pack_fmt, regs[X86Reg.RFLAGS]))
         # write segment registers
@@ -239,13 +247,22 @@ class LibVMIStub(GDBStub):
             pack_fmt = '@I'
         else:
             pack_fmt = '@Q'
-        gen_regs_32 = [
-            X86Reg.RAX, X86Reg.RCX, X86Reg.RDX, X86Reg.RBX,
-            X86Reg.RSP, X86Reg.RBP, X86Reg.RSI, X86Reg.RDI, X86Reg.RIP
-        ]
 
-        gen_regs_64 = [
-            X86Reg.R9, X86Reg.R10, X86Reg.R11, X86Reg.R12,
+        # for some reason,  GDB has a different parsing for gen registers
+        # between 32 and 64 bits
+        if addr_width == 4:
+            gen_regs_x86 = [
+                X86Reg.RAX, X86Reg.RCX, X86Reg.RDX, X86Reg.RBX,
+                X86Reg.RSP, X86Reg.RBP, X86Reg.RSI, X86Reg.RDI
+            ]
+        else:
+            gen_regs_x86 = [
+                X86Reg.RAX, X86Reg.RBX, X86Reg.RCX, X86Reg.RDX,
+                X86Reg.RSI, X86Reg.RDI, X86Reg.RBP, X86Reg.RSP
+            ]
+
+        gen_regs_x64 = [
+            X86Reg.R8, X86Reg.R9, X86Reg.R10, X86Reg.R11, X86Reg.R12,
             X86Reg.R13, X86Reg.R14, X86Reg.R15
         ]
 
@@ -253,19 +270,21 @@ class LibVMIStub(GDBStub):
         # regs = Registers()
         regs = self.vmi.get_vcpuregs(0)
         iter = struct.iter_unpack(pack_fmt, unhexlify(packet_data))
-        for r in gen_regs_32:
+        for r in gen_regs_x86:
             value, *rest = next(iter)
             logging.debug('%s: %x', r.name, value)
             regs[r] = value
         # 64 bits ?
         if addr_width == 8:
-            for r in gen_regs_64:
+            for r in gen_regs_x64:
                 value, *rest = next(iter)
                 logging.debug('%s: %x', r.name, value)
                 regs[r] = value
+        # RIP ?
+        value, *rest = next(iter)
+        regs[X86Reg.RIP] = value
         # eflags
         value, *rest = next(iter)
-        logging.debug('%s: %x', X86Reg.RFLAGS.name, value)
         regs[X86Reg.RFLAGS] = value
         # TODO segment registers
         try:
@@ -355,7 +374,8 @@ class LibVMIStub(GDBStub):
             addr = int(m.group('addr'), 16)
             return False
 
-        self.bp.singlestep_once()
+        self.ctx.bpm.wait_process_scheduled()
+        self.ctx.bpm.singlestep_once()
 
         msg = b'S%.2x' % GDBSignal.TRAP.value
         self.send_packet(GDBPacket(msg))
@@ -390,7 +410,7 @@ class LibVMIStub(GDBStub):
         kind = int(m.group('kind'), 16)
         if btype == 0:
             # software breakpoint
-            self.bp.del_bp(addr)
+            self.ctx.bpm.del_swbp(addr)
             self.send_packet(GDBPacket(b'OK'))
             return True
         return False
@@ -408,16 +428,16 @@ class LibVMIStub(GDBStub):
             # software breakpoint
             cb_data = {
                 'stub': self,
-                'stop_listen': self.bp.stop_listen,
+                'stop_listen': self.ctx.bpm.stop_listen,
             }
-            self.bp.add_bp(addr, kind, self.ctx.cb_on_swbreak, cb_data)
+            self.ctx.bpm.add_swbp(addr, kind, self.ctx.cb_on_swbreak, cb_data)
             self.send_packet(GDBPacket(b'OK'))
             return True
         return False
 
     def breakin(self, packet_data):
         # stop event thread
-        self.bp.stop_listening()
+        self.ctx.bpm.stop_listening()
         self.ctx.attach()
         msg = b'S%.2x' % GDBSignal.TRAP.value
         self.send_packet(GDBPacket(msg))
@@ -429,7 +449,7 @@ class LibVMIStub(GDBStub):
             # TODO refactoring, this should be treated as an unknown packet
             self.send_packet(GDBPacket(b''))
             return True
-        if re.match(b'Cont\?', packet_data):
+        if re.match(b'Cont\\?', packet_data):
             # query the list of supported actions for vCont
             # reply: vCont[;action…]
             # we do not support continue or singlestep with a signal
@@ -442,7 +462,8 @@ class LibVMIStub(GDBStub):
             # we don't support threads
             action = m.group('action')
             if action == b's':
-                self.bp.singlestep_once()
+                self.ctx.bpm.wait_process_scheduled()
+                self.ctx.bpm.singlestep_once()
                 self.send_packet_noack(GDBPacket(b'T%.2x' % GDBSignal.TRAP.value))
                 return True
             if action == b'c':
@@ -462,7 +483,7 @@ class LibVMIStub(GDBStub):
     def action_continue(self):
         self.vmi.resume_vm()
         # start listening on VMI events, asynchronously
-        self.bp.listen(block=False)
+        self.ctx.bpm.listen(block=False)
 
     def set_supported_features(self, packet_data):
         # split string and get features in a list
